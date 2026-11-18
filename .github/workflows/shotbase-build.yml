@@ -235,11 +235,11 @@ jobs:
             xcrun simctl bootstatus "$UDID" -b
             sleep 10
             xcrun simctl ui "$UDID" appearance light
-            xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --cellularMode active --cellularBars 4 --wifiBars 3
+            xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState discharging --batteryLevel 100 --cellularMode active --cellularBars 4 --wifiBars 3
             xcrun simctl install "$UDID" "$APP"
             # Calentamiento: primer arranque en frio (caches, layout)
-            SIMCTL_CHILD_SHOTBASE_DEMO=search xcrun simctl launch "$UDID" "$BUNDLE" -AppleLanguages "(es)" -AppleLocale es_ES
-            sleep 12
+            SIMCTL_CHILD_SHOTBASE_DEMO=wifi xcrun simctl launch "$UDID" "$BUNDLE" -AppleLanguages "(es)" -AppleLocale es_ES
+            sleep 30
             xcrun simctl terminate "$UDID" "$BUNDLE"
           } > "$L" 2>&1
           SCENES="search:01-buscar wifi:02-wifi collections:03-colecciones timeline:04-cronologia event:05-entrada settings:06-ajustes paywall:07-paywall onboarding:08-privacidad"
@@ -247,10 +247,12 @@ jobs:
             if [ "$lang" = "es" ]; then LOC=es_ES; else LOC=en_US; fi
             for entry in $SCENES; do
               scene="${entry%%:*}"; name="${entry##*:}"
+              # Los detalles crean un EKEventStore (el primer arranque de remindd bloquea el hilo principal varios segundos)
+              case "$scene" in wifi|event) WAIT=20;; *) WAIT=10;; esac
               {
                 xcrun simctl terminate "$UDID" "$BUNDLE"
                 SIMCTL_CHILD_SHOTBASE_DEMO="$scene" xcrun simctl launch "$UDID" "$BUNDLE" -AppleLanguages "($lang)" -AppleLocale "$LOC"
-                sleep 7
+                sleep $WAIT
                 xcrun simctl io "$UDID" screenshot --type=png "$OUT/$lang/$name.png"
               } >> "$L" 2>&1
             done
