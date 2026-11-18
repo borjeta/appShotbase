@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "selftest, tests, compile, archive (Release sin firma) o both"
+        description: "selftest, tests, compile, archive (sin firma), both o testflight (firma y sube)"
         type: choice
-        options: [selftest, tests, compile, archive, both]
+        options: [selftest, tests, compile, archive, both, testflight]
         default: selftest
       ref:
         description: "Rama o commit del repo privado"
@@ -34,6 +34,7 @@ env:
 
 jobs:
   build:
+    if: inputs.job != 'testflight'
     runs-on: macos-26
     environment: builder
     timeout-minutes: 60
@@ -135,6 +136,192 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: logs-cifrados-${{ github.run_number }}
+          path: ${{ runner.temp }}/sealed/
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Resultado (solo códigos de salida, sin contenido)
+        if: always()
+        run: |
+          fail=0
+          for e in "$RUNNER_TEMP"/logs/*.exit; do
+            [ -f "$e" ] || continue
+            code=$(cat "$e"); echo "$(basename "$e" .exit): salida $code"
+            [ "$code" = "0" ] || fail=1
+          done
+          exit $fail
+
+  testflight:
+    if: inputs.job == 'testflight'
+    runs-on: macos-26
+    environment: release
+    timeout-minutes: 75
+    env:
+      DIST_P12_BASE64: ${{ secrets.DIST_P12_BASE64 }}
+      DIST_P12_PASSWORD: ${{ secrets.DIST_P12_PASSWORD }}
+      PROFILE_BASE64: ${{ secrets.PROFILE_BASE64 }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8_BASE64: ${{ secrets.ASC_KEY_P8_BASE64 }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      BUILD_NUMBER: ${{ github.run_number }}
+      BUNDLE_ID: com.borjaalventosa.shotbase
+      APPLE_APP_ID: "6836241316"
+    steps:
+      - name: Descargar el codigo privado (clave de solo lectura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borjeta/appShotbase-privado
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CODE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: code
+
+      - name: Versiones de Xcode y Swift
+        run: |
+          sudo xcode-select -s "$XCODE_PATH" || true
+          xcodebuild -version
+          swift --version
+
+      - name: Preparar cifrado de logs
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs" "$RUNNER_TEMP/sealed"
+          cat > "$RUNNER_TEMP/logs_public.pem" <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA1lHeQ33oqc4SSJR3o0Fw
+          2Z/9EONUvOJVZMQ/ql6RiKT3HogvI0M0g0z7lbVV4ixEMcO4hVK+oT6DGfojOR9Z
+          u5BEcJa8s17FoefBjIDFr59cK6nwaq8cnELC5+thkGg1DUa6kq/SjXBZuHbjMRQ+
+          pMllnHR2nGX6csaA24l7bGQbIlf59asi5QRZs3UaQADyPUWCFVlJyMCcOuBJijFt
+          L78sHJ/8Ul0BnD0AltcFMFYOfDzCpykozB8/iEwN3jCIAxzgc2VuZIUi+YAIOLJk
+          QXCdN0KasEPR/hgoggoQQiP4N75YtUxI6995sfvDKSI85yPP+7M5ZTKZUWYNaFuz
+          ER+KtYCHc+n8PcZQKTDPRKf2mY8imUkxxgezjPGlKSc7ant9byzd3Oui483ZCElB
+          KU/LDHjQRQ9C1WIxXjYo0CVmQ72WTJP3PXgceHIKrvmpP13uZ3j4uVXVm84qVZuJ
+          09a6JLb8H5yxlCL5omUv6pfOrLiwq6064oxLcKoof7S9zr/c2UK+RY82LZqqP5Xi
+          3UuuS0SM9u7k9qJN4iRRXODBivAqWABNOfRZ714+Jk2kDW1e+qN//XrwI0V1Y7Z6
+          gjf11Ie2IW8t8WV/WwO2Yzw5BWeXMOAI1FN/RJ/cDxw83YWiWZFiJT/OsqVUrErk
+          f10DzwtkcbuzrHqsNkTfsiECAwEAAQ==
+          -----END PUBLIC KEY-----
+          PEM
+          cat > "$RUNNER_TEMP/seal.sh" <<'SEAL'
+          #!/bin/bash
+          set -euo pipefail
+          f="$1"; out="$RUNNER_TEMP/sealed"; pass="$RUNNER_TEMP/pass.txt"
+          head -c 32 /dev/urandom | base64 > "$pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -md sha256 -pass "file:$pass" -in "$f" -out "$out/$(basename "$f").enc"
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/logs_public.pem" -in "$pass" -out "$out/$(basename "$f").key.enc"
+          rm -f "$pass"
+          echo "sellado: $(basename "$f") sha256=$(shasum -a 256 "$f" | cut -c1-16) bytes=$(wc -c < "$f" | tr -d ' ')"
+          SEAL
+          chmod +x "$RUNNER_TEMP/seal.sh"
+
+      - name: Instalar certificado y perfil (keychain temporal)
+        run: |
+          L="$RUNNER_TEMP/logs/firma.log"
+          set +e
+          KC="$RUNNER_TEMP/shotbase-build.keychain-db"; KCPASS="$(openssl rand -base64 24)"
+          echo "$KC" > "$RUNNER_TEMP/kc.path"
+          {
+            security create-keychain -p "$KCPASS" "$KC"
+            security set-keychain-settings -lut 21600 "$KC"
+            security unlock-keychain -p "$KCPASS" "$KC"
+            printf '%s' "$DIST_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dist.p12"
+            security import "$RUNNER_TEMP/dist.p12" -P "$DIST_P12_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+            security set-key-partition-list -S apple-tool:,apple: -k "$KCPASS" "$KC"
+            security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+            security find-identity -v -p codesigning "$KC"
+            printf '%s' "$PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/p.mobileprovision"
+            security cms -D -i "$RUNNER_TEMP/p.mobileprovision" > "$RUNNER_TEMP/p.plist"
+            UUID=$(plutil -extract UUID raw "$RUNNER_TEMP/p.plist")
+            PNAME=$(plutil -extract Name raw "$RUNNER_TEMP/p.plist")
+            mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+            cp "$RUNNER_TEMP/p.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+            echo "perfil instalado: $PNAME ($UUID)"
+          } > "$L" 2>&1
+          echo "$?" > "$RUNNER_TEMP/logs/firma.exit"
+          rm -f "$RUNNER_TEMP/dist.p12"
+          exit 0
+
+      - name: Archivar y firmar (Release, manual) - salida solo a fichero
+        run: |
+          cd code
+          set +e
+          ( command -v xcodegen >/dev/null || brew install xcodegen ) > "$RUNNER_TEMP/logs/setup.log" 2>&1
+          xcodegen generate >> "$RUNNER_TEMP/logs/setup.log" 2>&1
+          xcodebuild archive \
+            -project Shotbase.xcodeproj -scheme Shotbase -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/Shotbase.xcarchive" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER" \
+            OTHER_CODE_SIGN_FLAGS="--keychain $(cat "$RUNNER_TEMP/kc.path")" \
+            > "$RUNNER_TEMP/logs/archive.log" 2>&1
+          echo $? > "$RUNNER_TEMP/logs/archive.exit"
+          exit 0
+
+      - name: Exportar el .ipa (app-store-connect, firma manual)
+        run: |
+          set +e
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>teamID</key><string>${APPLE_TEAM_ID}</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key><dict><key>${BUNDLE_ID}</key><string>Shotbase AppStore</string></dict>
+            <key>uploadSymbols</key><true/>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/Shotbase.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            > "$RUNNER_TEMP/logs/export.log" 2>&1
+          echo $? > "$RUNNER_TEMP/logs/export.exit"
+          ls "$RUNNER_TEMP/export" >> "$RUNNER_TEMP/logs/export.log" 2>&1
+          exit 0
+
+      - name: Subir a App Store Connect (TestFlight)
+        run: |
+          set +e
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s' "$ASC_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8"
+          chmod 600 "$RUNNER_TEMP/keys/AuthKey_${ASC_KEY_ID}.p8"
+          export API_PRIVATE_KEYS_DIR="$RUNNER_TEMP/keys"
+          IPA=$(ls "$RUNNER_TEMP"/export/*.ipa 2>/dev/null | head -n1)
+          if [ -z "$IPA" ]; then echo "sin .ipa" > "$RUNNER_TEMP/logs/upload.log"; echo 1 > "$RUNNER_TEMP/logs/upload.exit"; exit 0; fi
+          xcrun altool --upload-package "$IPA" --type ios --apple-id "$APPLE_APP_ID" --bundle-id "$BUNDLE_ID" \
+            --bundle-short-version-string "1.0.0" --bundle-version "$BUILD_NUMBER" \
+            --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" > "$RUNNER_TEMP/logs/upload.log" 2>&1
+          RC=$?
+          if [ $RC -ne 0 ]; then
+            echo "=== fallback: --upload-app ===" >> "$RUNNER_TEMP/logs/upload.log"
+            xcrun altool --upload-app -f "$IPA" -t ios --apiKey "$ASC_KEY_ID" --apiIssuer "$ASC_ISSUER_ID" >> "$RUNNER_TEMP/logs/upload.log" 2>&1
+            RC=$?
+          fi
+          echo $RC > "$RUNNER_TEMP/logs/upload.exit"
+          exit 0
+
+      - name: Limpiar credenciales del runner
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/keys" "$RUNNER_TEMP/dist.p12" "$RUNNER_TEMP/p.mobileprovision" "$RUNNER_TEMP/p.plist" "$RUNNER_TEMP/export"
+          security delete-keychain "$(cat "$RUNNER_TEMP/kc.path" 2>/dev/null)" 2>/dev/null || true
+          rm -f "$HOME"/Library/MobileDevice/Provisioning\ Profiles/*.mobileprovision || true
+
+      - name: Cifrar los logs
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/logs/*.log; do [ -f "$f" ] && "$RUNNER_TEMP/seal.sh" "$f"; done
+          rm -rf "$RUNNER_TEMP/logs"/*.log
+
+      - name: Subir logs CIFRADOS
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-cifrados-testflight-${{ github.run_number }}
           path: ${{ runner.temp }}/sealed/
           retention-days: 3
           if-no-files-found: warn
