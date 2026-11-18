@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "selftest, tests, compile, archive (sin firma), both o testflight (firma y sube)"
+        description: "selftest, tests, compile, archive (sin firma), both, capturas (simulador) o testflight (firma y sube)"
         type: choice
-        options: [selftest, tests, compile, archive, both, testflight]
+        options: [selftest, tests, compile, archive, both, capturas, testflight]
         default: selftest
       ref:
         description: "Rama o commit del repo privado"
@@ -34,7 +34,7 @@ env:
 
 jobs:
   build:
-    if: inputs.job != 'testflight'
+    if: inputs.job != 'testflight' && inputs.job != 'capturas'
     runs-on: macos-26
     environment: builder
     timeout-minutes: 60
@@ -141,6 +141,162 @@ jobs:
           if-no-files-found: warn
 
       - name: Resultado (solo códigos de salida, sin contenido)
+        if: always()
+        run: |
+          fail=0
+          for e in "$RUNNER_TEMP"/logs/*.exit; do
+            [ -f "$e" ] || continue
+            code=$(cat "$e"); echo "$(basename "$e" .exit): salida $code"
+            [ "$code" = "0" ] || fail=1
+          done
+          exit $fail
+
+  capturas:
+    if: inputs.job == 'capturas'
+    runs-on: macos-26
+    environment: builder
+    timeout-minutes: 60
+    steps:
+      - name: Descargar el codigo privado (clave de solo lectura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borjeta/appShotbase-privado
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CODE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: code
+
+      - name: Versiones de Xcode y Swift
+        run: |
+          sudo xcode-select -s "$XCODE_PATH" || true
+          xcodebuild -version
+          swift --version
+
+      - name: Preparar cifrado de logs
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs" "$RUNNER_TEMP/sealed"
+          cat > "$RUNNER_TEMP/logs_public.pem" <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA1lHeQ33oqc4SSJR3o0Fw
+          2Z/9EONUvOJVZMQ/ql6RiKT3HogvI0M0g0z7lbVV4ixEMcO4hVK+oT6DGfojOR9Z
+          u5BEcJa8s17FoefBjIDFr59cK6nwaq8cnELC5+thkGg1DUa6kq/SjXBZuHbjMRQ+
+          pMllnHR2nGX6csaA24l7bGQbIlf59asi5QRZs3UaQADyPUWCFVlJyMCcOuBJijFt
+          L78sHJ/8Ul0BnD0AltcFMFYOfDzCpykozB8/iEwN3jCIAxzgc2VuZIUi+YAIOLJk
+          QXCdN0KasEPR/hgoggoQQiP4N75YtUxI6995sfvDKSI85yPP+7M5ZTKZUWYNaFuz
+          ER+KtYCHc+n8PcZQKTDPRKf2mY8imUkxxgezjPGlKSc7ant9byzd3Oui483ZCElB
+          KU/LDHjQRQ9C1WIxXjYo0CVmQ72WTJP3PXgceHIKrvmpP13uZ3j4uVXVm84qVZuJ
+          09a6JLb8H5yxlCL5omUv6pfOrLiwq6064oxLcKoof7S9zr/c2UK+RY82LZqqP5Xi
+          3UuuS0SM9u7k9qJN4iRRXODBivAqWABNOfRZ714+Jk2kDW1e+qN//XrwI0V1Y7Z6
+          gjf11Ie2IW8t8WV/WwO2Yzw5BWeXMOAI1FN/RJ/cDxw83YWiWZFiJT/OsqVUrErk
+          f10DzwtkcbuzrHqsNkTfsiECAwEAAQ==
+          -----END PUBLIC KEY-----
+          PEM
+          cat > "$RUNNER_TEMP/seal.sh" <<'SEAL'
+          #!/bin/bash
+          set -euo pipefail
+          f="$1"; out="$RUNNER_TEMP/sealed"; pass="$RUNNER_TEMP/pass.txt"
+          head -c 32 /dev/urandom | base64 > "$pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -md sha256 -pass "file:$pass" -in "$f" -out "$out/$(basename "$f").enc"
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/logs_public.pem" -in "$pass" -out "$out/$(basename "$f").key.enc"
+          rm -f "$pass"
+          echo "sellado: $(basename "$f") sha256=$(shasum -a 256 "$f" | cut -c1-16) bytes=$(wc -c < "$f" | tr -d ' ')"
+          SEAL
+          chmod +x "$RUNNER_TEMP/seal.sh"
+
+      - name: Compilar Debug para el simulador (salida solo a fichero)
+        run: |
+          cd code
+          set +e
+          ( command -v xcodegen >/dev/null || brew install xcodegen ) > "$RUNNER_TEMP/logs/setup.log" 2>&1
+          xcodegen generate >> "$RUNNER_TEMP/logs/setup.log" 2>&1
+          echo $? > "$RUNNER_TEMP/logs/xcodegen.exit"
+          UDID=$(xcrun simctl list devices available 2>/dev/null | grep -F "$SIM_DEVICE_NAME (" | tail -1 | grep -oE '[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}')
+          echo "$UDID" > "$RUNNER_TEMP/udid.txt"
+          xcodebuild build -project Shotbase.xcodeproj -scheme Shotbase -configuration Debug -destination "platform=iOS Simulator,id=$UDID" -derivedDataPath "$RUNNER_TEMP/DerivedData" CODE_SIGNING_ALLOWED=NO > "$RUNNER_TEMP/logs/compile.log" 2>&1
+          echo $? > "$RUNNER_TEMP/logs/compile.exit"
+          exit 0
+
+      - name: Capturas de las escenas demo en es y en (salida solo a fichero)
+        run: |
+          set +e
+          L="$RUNNER_TEMP/logs/simulador.log"
+          if [ "$(cat "$RUNNER_TEMP/logs/compile.exit" 2>/dev/null)" != "0" ]; then
+            echo "sin compilacion: no hay capturas"
+            echo 1 > "$RUNNER_TEMP/logs/capturas.exit"
+            exit 0
+          fi
+          UDID=$(cat "$RUNNER_TEMP/udid.txt")
+          APP="$RUNNER_TEMP/DerivedData/Build/Products/Debug-iphonesimulator/Shotbase.app"
+          BUNDLE=com.borjaalventosa.shotbase
+          OUT="$RUNNER_TEMP/capturas"
+          mkdir -p "$OUT/es" "$OUT/en"
+          {
+            xcrun simctl boot "$UDID"
+            xcrun simctl bootstatus "$UDID" -b
+            sleep 10
+            xcrun simctl ui "$UDID" appearance light
+            xcrun simctl status_bar "$UDID" override --time 9:41 --batteryState charged --batteryLevel 100 --cellularMode active --cellularBars 4 --wifiBars 3
+            xcrun simctl install "$UDID" "$APP"
+            # Calentamiento: primer arranque en frio (caches, layout)
+            SIMCTL_CHILD_SHOTBASE_DEMO=search xcrun simctl launch "$UDID" "$BUNDLE" -AppleLanguages "(es)" -AppleLocale es_ES
+            sleep 12
+            xcrun simctl terminate "$UDID" "$BUNDLE"
+          } > "$L" 2>&1
+          SCENES="search:01-buscar wifi:02-wifi collections:03-colecciones timeline:04-cronologia event:05-entrada settings:06-ajustes paywall:07-paywall onboarding:08-privacidad"
+          for lang in es en; do
+            if [ "$lang" = "es" ]; then LOC=es_ES; else LOC=en_US; fi
+            for entry in $SCENES; do
+              scene="${entry%%:*}"; name="${entry##*:}"
+              {
+                xcrun simctl terminate "$UDID" "$BUNDLE"
+                SIMCTL_CHILD_SHOTBASE_DEMO="$scene" xcrun simctl launch "$UDID" "$BUNDLE" -AppleLanguages "($lang)" -AppleLocale "$LOC"
+                sleep 7
+                xcrun simctl io "$UDID" screenshot --type=png "$OUT/$lang/$name.png"
+              } >> "$L" 2>&1
+            done
+          done
+          xcrun simctl spawn "$UDID" log show --last 20m --style compact --predicate 'process == "Shotbase"' > "$RUNNER_TEMP/logs/applog.log" 2>&1
+          ls "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -i shotbase > "$RUNNER_TEMP/logs/crash.log" 2>&1
+          for f in "$HOME"/Library/Logs/DiagnosticReports/Shotbase*; do [ -f "$f" ] && { echo "=== $f"; head -c 6000 "$f"; } >> "$RUNNER_TEMP/logs/crash.log"; done
+          bad=0; count=0
+          for f in "$OUT"/es/*.png "$OUT"/en/*.png; do
+            [ -f "$f" ] || continue
+            count=$((count+1))
+            w=$(sips -g pixelWidth "$f" | awk '/pixelWidth/{print $2}')
+            h=$(sips -g pixelHeight "$f" | awk '/pixelHeight/{print $2}')
+            echo "$(basename "$(dirname "$f")")/$(basename "$f") ${w}x${h}"
+            { [ "$w" = "1320" ] && [ "$h" = "2868" ]; } || bad=1
+          done
+          [ "$count" = "16" ] || bad=1
+          echo "capturas: $count archivos"
+          echo $bad > "$RUNNER_TEMP/logs/capturas.exit"
+          exit 0
+
+      - name: Cifrar los logs
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/logs/*.log; do [ -f "$f" ] && "$RUNNER_TEMP/seal.sh" "$f"; done
+          rm -rf "$RUNNER_TEMP/logs"/*.log
+
+      - name: Subir logs CIFRADOS
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-cifrados-${{ github.run_number }}
+          path: ${{ runner.temp }}/sealed/
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Subir capturas (imagenes de marketing con datos ficticios, sin cifrar)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: capturas-${{ github.run_number }}
+          path: ${{ runner.temp }}/capturas/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Resultado (solo codigos de salida, sin contenido)
         if: always()
         run: |
           fail=0
