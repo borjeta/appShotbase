@@ -122,7 +122,7 @@ jobs:
           xcodebuild archive -project Shotbase.xcodeproj -scheme Shotbase -configuration Release -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Shotbase.xcarchive" CODE_SIGNING_ALLOWED=NO > "$RUNNER_TEMP/logs/archive.log" 2>&1
           echo $? > "$RUNNER_TEMP/logs/archive.exit"
           APP="$RUNNER_TEMP/Shotbase.xcarchive/Products/Applications/Shotbase.app"
-          { echo "--- Info.plist del .app ---"; plutil -p "$APP/Info.plist" | grep -E "CFBundle(Identifier|ShortVersionString|Version|IconName)|MinimumOSVersion|ITSAppUses|UIDeviceFamily|NS[A-Za-z]+UsageDescription" ; echo "--- iconos en el bundle ---"; ls "$APP" | grep -iE "AppIcon|Assets.car|PrivacyInfo|Localizable|InfoPlist" ; echo "--- entitlements ---"; codesign -d --entitlements - "$APP" 2>&1 | head -20 ; } > "$RUNNER_TEMP/logs/inspect.log" 2>&1
+          { echo "--- Info.plist del .app ---"; plutil -p "$APP/Info.plist" | grep -E "CFBundle(Identifier|ShortVersionString|Version|IconName)|MinimumOSVersion|ITSAppUses|UIDeviceFamily|NS[A-Za-z]+UsageDescription" ; echo "--- iconos en el bundle ---"; ls "$APP" | grep -iE "AppIcon|Assets.car|PrivacyInfo|Localizable|InfoPlist" ; echo "--- entitlements ---"; codesign -d --entitlements - "$APP" 2>&1 | head -20 ; echo "--- codigo demo en el binario Release (cada recuento debe ser 0) ---" ; for pat in SHOTBASE_DEMO demo-wifi-hotel DemoCatalog DemoMode installDemoPlans enterDemo; do echo "$pat: $(strings -a "$APP/Shotbase" | grep -c "$pat")"; done ; } > "$RUNNER_TEMP/logs/inspect.log" 2>&1
           exit 0
 
       - name: Cifrar los logs
