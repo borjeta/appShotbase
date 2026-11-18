@@ -13,9 +13,9 @@ on:
   workflow_dispatch:
     inputs:
       job:
-        description: "selftest (comprueba acceso y cifrado), tests, compile o both"
+        description: "selftest, tests, compile, archive (Release sin firma) o both"
         type: choice
-        options: [selftest, tests, compile, both]
+        options: [selftest, tests, compile, archive, both]
         default: selftest
       ref:
         description: "Rama o commit del repo privado"
@@ -109,6 +109,19 @@ jobs:
           echo $? > "$RUNNER_TEMP/logs/xcodegen.exit"
           xcodebuild build             -project Shotbase.xcodeproj             -scheme Shotbase             -configuration Debug             -destination "platform=iOS Simulator,name=$SIM_DEVICE_NAME"             -derivedDataPath "$RUNNER_TEMP/DerivedData"             CODE_SIGNING_ALLOWED=NO             > "$RUNNER_TEMP/logs/compile.log" 2>&1
           echo $? > "$RUNNER_TEMP/logs/compile.exit"
+          exit 0
+
+      - name: Archivar en Release para dispositivo, sin firma (salida solo a fichero)
+        if: inputs.job == 'archive'
+        run: |
+          cd code
+          set +e
+          ( command -v xcodegen >/dev/null || brew install xcodegen ) > "$RUNNER_TEMP/logs/setup.log" 2>&1
+          xcodegen generate >> "$RUNNER_TEMP/logs/setup.log" 2>&1
+          xcodebuild archive -project Shotbase.xcodeproj -scheme Shotbase -configuration Release -destination 'generic/platform=iOS' -archivePath "$RUNNER_TEMP/Shotbase.xcarchive" CODE_SIGNING_ALLOWED=NO > "$RUNNER_TEMP/logs/archive.log" 2>&1
+          echo $? > "$RUNNER_TEMP/logs/archive.exit"
+          APP="$RUNNER_TEMP/Shotbase.xcarchive/Products/Applications/Shotbase.app"
+          { echo "--- Info.plist del .app ---"; plutil -p "$APP/Info.plist" | grep -E "CFBundle(Identifier|ShortVersionString|Version|IconName)|MinimumOSVersion|ITSAppUses|UIDeviceFamily|NS[A-Za-z]+UsageDescription" ; echo "--- iconos en el bundle ---"; ls "$APP" | grep -iE "AppIcon|Assets.car|PrivacyInfo|Localizable|InfoPlist" ; echo "--- entitlements ---"; codesign -d --entitlements - "$APP" 2>&1 | head -20 ; } > "$RUNNER_TEMP/logs/inspect.log" 2>&1
           exit 0
 
       - name: Cifrar los logs
