@@ -1,0 +1,138 @@
+# Compila el código PRIVADO borjeta/appShotbase-privado en un runner macOS (gratis en repos públicos).
+#
+# SEGURIDAD (ver docs/ESTADO-PUBLICACION.md en el repo privado):
+#  - Solo se dispara a mano (workflow_dispatch); nada de pull_request ni push.
+#  - Clave de despliegue de SOLO LECTURA, válida solo para el repo privado, guardada como secreto del
+#    entorno "builder", que solo es accesible desde la rama main de este repo.
+#  - Ninguna salida de compilación va al log público: todo se redirige a ficheros que se CIFRAN
+#    (AES-256 + RSA-4096). La clave privada para descifrar solo existe en el equipo del titular.
+#  - Solo acciones oficiales de GitHub, fijadas por commit. Sin permisos para GITHUB_TOKEN.
+name: Shotbase iOS build (codigo privado)
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "selftest (comprueba acceso y cifrado), tests, compile o both"
+        type: choice
+        options: [selftest, tests, compile, both]
+        default: selftest
+      ref:
+        description: "Rama o commit del repo privado"
+        type: string
+        default: main
+
+permissions: {}
+
+concurrency:
+  group: shotbase-build
+  cancel-in-progress: false
+
+env:
+  XCODE_PATH: /Applications/Xcode_26.6.app
+  SIM_DEVICE_NAME: iPhone 17 Pro Max
+
+jobs:
+  build:
+    runs-on: macos-26
+    environment: builder
+    timeout-minutes: 60
+    steps:
+      - name: Descargar el codigo privado (clave de solo lectura)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: borjeta/appShotbase-privado
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.CODE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: code
+
+      - name: Versiones de Xcode y Swift
+        run: |
+          sudo xcode-select -s "$XCODE_PATH" || true
+          xcodebuild -version
+          swift --version
+
+      - name: Preparar cifrado de logs
+        run: |
+          mkdir -p "$RUNNER_TEMP/logs" "$RUNNER_TEMP/sealed"
+          cat > "$RUNNER_TEMP/logs_public.pem" <<'PEM'
+          -----BEGIN PUBLIC KEY-----
+          MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEA1lHeQ33oqc4SSJR3o0Fw
+          2Z/9EONUvOJVZMQ/ql6RiKT3HogvI0M0g0z7lbVV4ixEMcO4hVK+oT6DGfojOR9Z
+          u5BEcJa8s17FoefBjIDFr59cK6nwaq8cnELC5+thkGg1DUa6kq/SjXBZuHbjMRQ+
+          pMllnHR2nGX6csaA24l7bGQbIlf59asi5QRZs3UaQADyPUWCFVlJyMCcOuBJijFt
+          L78sHJ/8Ul0BnD0AltcFMFYOfDzCpykozB8/iEwN3jCIAxzgc2VuZIUi+YAIOLJk
+          QXCdN0KasEPR/hgoggoQQiP4N75YtUxI6995sfvDKSI85yPP+7M5ZTKZUWYNaFuz
+          ER+KtYCHc+n8PcZQKTDPRKf2mY8imUkxxgezjPGlKSc7ant9byzd3Oui483ZCElB
+          KU/LDHjQRQ9C1WIxXjYo0CVmQ72WTJP3PXgceHIKrvmpP13uZ3j4uVXVm84qVZuJ
+          09a6JLb8H5yxlCL5omUv6pfOrLiwq6064oxLcKoof7S9zr/c2UK+RY82LZqqP5Xi
+          3UuuS0SM9u7k9qJN4iRRXODBivAqWABNOfRZ714+Jk2kDW1e+qN//XrwI0V1Y7Z6
+          gjf11Ie2IW8t8WV/WwO2Yzw5BWeXMOAI1FN/RJ/cDxw83YWiWZFiJT/OsqVUrErk
+          f10DzwtkcbuzrHqsNkTfsiECAwEAAQ==
+          -----END PUBLIC KEY-----
+          PEM
+          cat > "$RUNNER_TEMP/seal.sh" <<'SEAL'
+          #!/bin/bash
+          set -euo pipefail
+          f="$1"; out="$RUNNER_TEMP/sealed"; pass="$RUNNER_TEMP/pass.txt"
+          head -c 32 /dev/urandom | base64 > "$pass"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -iter 100000 -md sha256 -pass "file:$pass" -in "$f" -out "$out/$(basename "$f").enc"
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/logs_public.pem" -in "$pass" -out "$out/$(basename "$f").key.enc"
+          rm -f "$pass"
+          echo "sellado: $(basename "$f") sha256=$(shasum -a 256 "$f" | cut -c1-16) bytes=$(wc -c < "$f" | tr -d ' ')"
+          SEAL
+          chmod +x "$RUNNER_TEMP/seal.sh"
+
+      - name: Selftest (solo comprueba acceso al repo privado y el cifrado)
+        if: inputs.job == 'selftest'
+        run: |
+          { echo "selftest $(date -u +%FT%TZ)"; ls code | head -20; git -C code log -1 --format='commit %h'; } > "$RUNNER_TEMP/logs/selftest.log" 2>&1
+          echo "0" > "$RUNNER_TEMP/logs/selftest.exit"
+
+      - name: Tests de ShotbaseKit (salida solo a fichero)
+        if: inputs.job == 'tests' || inputs.job == 'both'
+        run: |
+          cd code/Packages/ShotbaseKit
+          set +e
+          swift test > "$RUNNER_TEMP/logs/tests.log" 2>&1
+          echo $? > "$RUNNER_TEMP/logs/tests.exit"
+          exit 0
+
+      - name: Compilar la app para el simulador, sin firma (salida solo a fichero)
+        if: inputs.job == 'compile' || inputs.job == 'both'
+        run: |
+          cd code
+          set +e
+          ( command -v xcodegen >/dev/null || brew install xcodegen ) > "$RUNNER_TEMP/logs/setup.log" 2>&1
+          xcodegen generate >> "$RUNNER_TEMP/logs/setup.log" 2>&1
+          echo $? > "$RUNNER_TEMP/logs/xcodegen.exit"
+          xcodebuild build             -project Shotbase.xcodeproj             -scheme Shotbase             -configuration Debug             -destination "platform=iOS Simulator,name=$SIM_DEVICE_NAME"             -derivedDataPath "$RUNNER_TEMP/DerivedData"             CODE_SIGNING_ALLOWED=NO             > "$RUNNER_TEMP/logs/compile.log" 2>&1
+          echo $? > "$RUNNER_TEMP/logs/compile.exit"
+          exit 0
+
+      - name: Cifrar los logs
+        if: always()
+        run: |
+          for f in "$RUNNER_TEMP"/logs/*.log; do [ -f "$f" ] && "$RUNNER_TEMP/seal.sh" "$f"; done
+          rm -rf "$RUNNER_TEMP/logs"/*.log
+
+      - name: Subir logs CIFRADOS
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: logs-cifrados-${{ github.run_number }}
+          path: ${{ runner.temp }}/sealed/
+          retention-days: 3
+          if-no-files-found: warn
+
+      - name: Resultado (solo códigos de salida, sin contenido)
+        if: always()
+        run: |
+          fail=0
+          for e in "$RUNNER_TEMP"/logs/*.exit; do
+            [ -f "$e" ] || continue
+            code=$(cat "$e"); echo "$(basename "$e" .exit): salida $code"
+            [ "$code" = "0" ] || fail=1
+          done
+          exit $fail
